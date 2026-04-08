@@ -1,54 +1,46 @@
 --[[
     InputController.luau  (Client)
     ──────────────────────────────────────────────────────────
-    Single point of truth for raw input on the client.
-    No game logic here — just clean signal forwarding.
-    Swap this file to support gamepad/mobile without touching
-    any other module.
-
-    Signals (using BindableEvents):
-        onAttack  → fired on M1 press (left-click)
-        onBlockStart → fired when F is held down
-        onBlockEnd   → fired when F is released
+    v2: Added Space hold/release signals for air combo arming.
+    Everything else unchanged from v1.
 ]]
 
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
 
--- ─── PRIVATE STATE ───────────────────────────────────────────────────────────
--- We use BindableEvents as lightweight typed signals.
--- These are module-local; only InputController fires them.
 local _attackEvent = Instance.new("BindableEvent")
 local _blockStartEvent = Instance.new("BindableEvent")
 local _blockEndEvent = Instance.new("BindableEvent")
+local _spaceHoldEvent = Instance.new("BindableEvent") -- NEW
+local _spaceReleaseEvent = Instance.new("BindableEvent") -- NEW
 
 local _enabled = true
 local _blockHeld = false
+local _spaceHeld = false -- NEW
 
--- ─── MODULE ──────────────────────────────────────────────────────────────────
 local InputController = {}
 
--- Public read-only signal references.
--- Other modules do: InputController.onAttack:Connect(...)
 InputController.onAttack = _attackEvent.Event
 InputController.onBlockStart = _blockStartEvent.Event
 InputController.onBlockEnd = _blockEndEvent.Event
+InputController.onSpaceHold = _spaceHoldEvent.Event -- NEW
+InputController.onSpaceRelease = _spaceReleaseEvent.Event -- NEW
 
--- ── Enable / Disable ─────────────────────────────────────
--- Disable during cutscenes, menus, emotes, etc.
 function InputController.setEnabled(enabled: boolean)
 	_enabled = enabled
-	-- If disabled while block is held, fire blockEnd so state is consistent.
-	if not enabled and _blockHeld then
-		_blockHeld = false
-		_blockEndEvent:Fire()
+	if not enabled then
+		if _blockHeld then
+			_blockHeld = false
+			_blockEndEvent:Fire()
+		end
+		-- Release space tracking so air combo state stays clean on disable.
+		if _spaceHeld then
+			_spaceHeld = false
+			_spaceReleaseEvent:Fire()
+		end
 	end
 end
 
--- ── Input Connections ─────────────────────────────────────
--- InputBegan: M1 click, F press
 UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
-	-- Ignore if UI is eating this input (chat, menus, etc.)
 	if gameProcessed then
 		return
 	end
@@ -63,11 +55,17 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: 
 			_blockHeld = true
 			_blockStartEvent:Fire()
 		end
+	elseif input.KeyCode == Enum.KeyCode.Space then
+		-- We track space independently from the engine jump so we can
+		-- arm air combos even when jump is currently disabled.
+		if not _spaceHeld then
+			_spaceHeld = true
+			_spaceHoldEvent:Fire()
+		end
 	end
 end)
 
--- InputEnded: F release
-UserInputService.InputEnded:Connect(function(input: InputObject, _gameProcessed: boolean)
+UserInputService.InputEnded:Connect(function(input: InputObject, _gp: boolean)
 	if not _enabled then
 		return
 	end
@@ -75,14 +73,20 @@ UserInputService.InputEnded:Connect(function(input: InputObject, _gameProcessed:
 	if input.KeyCode == Enum.KeyCode.F and _blockHeld then
 		_blockHeld = false
 		_blockEndEvent:Fire()
+	elseif input.KeyCode == Enum.KeyCode.Space and _spaceHeld then
+		_spaceHeld = false
+		_spaceReleaseEvent:Fire()
 	end
 end)
 
--- Guard: if focus is lost (e.g., alt-tab), release block automatically.
 UserInputService.WindowFocusReleased:Connect(function()
 	if _blockHeld then
 		_blockHeld = false
 		_blockEndEvent:Fire()
+	end
+	if _spaceHeld then
+		_spaceHeld = false
+		_spaceReleaseEvent:Fire()
 	end
 end)
 

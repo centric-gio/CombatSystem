@@ -1,53 +1,52 @@
 --[[
     CombatClient.client.luau
     ──────────────────────────────────────────────────────────
-    Entry point for all client-side combat logic.
-    Initialises every module and wires them together.
-    Handles character respawns cleanly.
-
-    Dependency graph:
-      InputController ──► ComboController ──► AnimController
-                      └──► BlockController ──► AnimController
-                                          └──► BlockUI
-      All receive StateMachine reference.
-      All combat remotes wired here.
+    v3: Fixed declaration order, completed ComboController.new()
+    call, wired all ragdoll/float remotes.
 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+-- IMPORTANT: Script reference must be declared before any sibling requires.
+local Script = script
+
 -- ── Shared Modules ─────────────────────────────────────────
 local StateMachine = require(ReplicatedStorage.Shared.StateMachine)
 local CombatConfig = require(ReplicatedStorage.Shared.CombatConfig)
 
--- ── Client Modules (siblings of this Script) ───────────────
-local Script = script -- reference for sibling requires
+-- ── Client Modules ─────────────────────────────────────────
 local InputController = require(Script.Parent.InputController)
 local AnimationController = require(Script.Parent.AnimationController)
 local ComboController = require(Script.Parent.ComboController)
 local BlockController = require(Script.Parent.BlockController)
 local BlockUI = require(Script.Parent.BlockUI)
 local HitEffects = require(Script.Parent.HitEffects)
+local ScreenEffects = require(Script.Parent.ScreenEffects)
 
 local LocalPlayer = Players.LocalPlayer
 
 -- ─── REMOTE REFERENCES ───────────────────────────────────────────────────────
--- These are created by CombatServer on startup. We wait for them.
 local CombatRemotes = ReplicatedStorage:WaitForChild("CombatRemotes", 10)
 assert(CombatRemotes, "[CombatClient] CombatRemotes folder not found!")
 
+-- Client → Server
 local AttackRequestRemote = CombatRemotes:WaitForChild("AttackRequest") :: RemoteEvent
 local BlockStateRemote = CombatRemotes:WaitForChild("BlockState") :: RemoteEvent
+
+-- Server → Client
 local HitConfirmedRemote = CombatRemotes:WaitForChild("HitConfirmed") :: RemoteEvent
 local BlockSyncRemote = CombatRemotes:WaitForChild("BlockSync") :: RemoteEvent
 local BlockBrokenRemote = CombatRemotes:WaitForChild("BlockBroken") :: RemoteEvent
 local ParrySuccessRemote = CombatRemotes:WaitForChild("ParrySuccess") :: RemoteEvent
 local StateSyncRemote = CombatRemotes:WaitForChild("StateSync") :: RemoteEvent
+local RagdollStartRemote = CombatRemotes:WaitForChild("RagdollStart") :: RemoteEvent
+local RagdollEndRemote = CombatRemotes:WaitForChild("RagdollEnd") :: RemoteEvent
+local FloatStartRemote = CombatRemotes:WaitForChild("FloatStart") :: RemoteEvent
+local FloatEndRemote = CombatRemotes:WaitForChild("FloatEnd") :: RemoteEvent
 
--- ─── SESSION STATE ───────────────────────────────────────────────────────────
--- Holds all per-character module instances.
--- Cleaned up and recreated on respawn.
+-- ─── SESSION TYPE ────────────────────────────────────────────────────────────
 type CombatSession = {
 	stateMachine: { is: any, transition: any, forceTransition: any, update: any, destroy: any },
 	animCtrl: { play: any, stop: any, stopAll: any, destroy: any },
@@ -55,41 +54,32 @@ type CombatSession = {
 	blockCtrl: { onBlockStart: any, onBlockEnd: any, setMeter: any, isBlocking: any, destroy: any },
 	blockUI: { setMeter: any, flash: any, setVisible: any, destroy: any },
 	heartbeatConn: RBXScriptConnection,
+	humanoid: Humanoid?,
+	hrp: BasePart?,
 }
 
 local _session: CombatSession? = nil
 
--- ─── BUILD COMBAT STATE MACHINE ──────────────────────────────────────────────
-local function buildStateMachine(): typeof(StateMachine.new("Idle", {}))
-	--[[
-        State transition whitelist.
-        Changing this table is the ONLY place to add new states.
-        Transitions NOT in the whitelist are blocked with a warning.
-    ]]
+-- ─── STATE MACHINE BUILDER ───────────────────────────────────────────────────
+local function buildStateMachine()
 	return StateMachine.new("Idle", {
 		Idle = {
 			canTransitionTo = { "Attacking", "Blocking", "Stunned", "Dead" },
-			onEnter = function(_prev)
-				-- Nothing special — future: play idle animation
-			end,
+			onEnter = function(_prev) end,
 		},
 		Attacking = {
 			canTransitionTo = { "Idle", "Stunned", "Dead" },
-			-- We intentionally DON'T allow Attacking → Blocking mid-swing.
-			-- Player must finish their swing first (punishes over-aggression).
 		},
 		Blocking = {
 			canTransitionTo = { "Idle", "BlockStun", "Stunned", "Dead" },
 		},
 		BlockStun = {
-			-- Brief freeze after absorbing a hit; can return to block or idle.
 			canTransitionTo = { "Idle", "Blocking", "Dead" },
 		},
 		Stunned = {
 			canTransitionTo = { "Idle", "Dead" },
 		},
 		Dead = {
-			-- Terminal state — only forceTransition out (on respawn we rebuild).
 			canTransitionTo = {},
 		},
 	})
@@ -97,7 +87,7 @@ end
 
 -- ─── INIT SESSION ────────────────────────────────────────────────────────────
 local function initSession(character: Model)
-	-- Clean up any previous session (respawn case)
+	-- Clean up previous session (respawn)
 	if _session then
 		_session.heartbeatConn:Disconnect()
 		_session.stateMachine:destroy()
@@ -108,10 +98,25 @@ local function initSession(character: Model)
 		_session = nil
 	end
 
-	-- Build all module instances for this character.
+	local humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
+	local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+
 	local sm = buildStateMachine()
 	local animCtrl = AnimationController.new(character)
 	local blockUi = BlockUI.new()
+
+	-- Wire jump toggle to state transitions.
+	-- ComboController also disables jump per-swing; this is a backup layer.
+	sm:onChanged(function(from: string, to: string)
+		if not humanoid then
+			return
+		end
+		if to == "Attacking" then
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		elseif from == "Attacking" and to == "Idle" then
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		end
+	end)
 
 	local blockCtrl = BlockController.new({
 		stateMachine = sm,
@@ -120,16 +125,18 @@ local function initSession(character: Model)
 		blockRemote = BlockStateRemote,
 	})
 
+	-- ── THIS IS THE BUG THAT WAS MISSING: the function body + closing ──
 	local comboCtrl = ComboController.new({
 		stateMachine = sm,
 		animController = animCtrl,
 		attackRemote = AttackRequestRemote,
+		humanoidRef = humanoid,
 		onHitEffectRequest = function(comboIndex: number)
 			HitEffects.onSwingStart(comboIndex)
 		end,
 	})
 
-	-- ── Per-frame update ─────────────────────────────────
+	-- Per-frame update loop
 	local hbConn = RunService.Heartbeat:Connect(function(dt: number)
 		sm:update(dt)
 		comboCtrl:update(dt)
@@ -142,9 +149,10 @@ local function initSession(character: Model)
 		blockCtrl = blockCtrl,
 		blockUI = blockUi,
 		heartbeatConn = hbConn,
+		humanoid = humanoid,
+		hrp = hrp,
 	}
 
-	-- Show initial block meter as invisible/full
 	blockUi:setVisible(false)
 end
 
@@ -171,9 +179,8 @@ InputController.onBlockEnd:Connect(function()
 	_session.blockCtrl:onBlockEnd()
 end)
 
--- ─── SERVER EVENT WIRING ─────────────────────────────────────────────────────
+-- ─── SERVER EVENT HANDLERS ───────────────────────────────────────────────────
 
--- Server confirmed a hit landed on someone we attacked.
 HitConfirmedRemote.OnClientEvent:Connect(function(result: {
 	targetUserId: number,
 	damage: number,
@@ -188,13 +195,16 @@ HitConfirmedRemote.OnClientEvent:Connect(function(result: {
 	end
 
 	if result.wasParried then
-		-- We were parried — server will also send StateSync to stun us.
 		HitEffects.onParry()
 		return
 	end
 
-	local targetChar = Players:GetPlayerByUserId(result.targetUserId)
-		and Players:GetPlayerByUserId(result.targetUserId).Character
+	-- targetUserId == 0 means we hit an NPC dummy
+	local targetChar: Model? = nil
+	if result.targetUserId ~= 0 then
+		local targetPlayer = Players:GetPlayerByUserId(result.targetUserId)
+		targetChar = targetPlayer and targetPlayer.Character or nil
+	end
 
 	if result.wasBlocked then
 		HitEffects.onBlockHit(result.position)
@@ -208,7 +218,6 @@ HitConfirmedRemote.OnClientEvent:Connect(function(result: {
 	end
 end)
 
--- Server syncing THIS player's block meter (after we got hit while blocking).
 BlockSyncRemote.OnClientEvent:Connect(function(payload: {
 	meter: number,
 	isBroken: boolean,
@@ -219,7 +228,6 @@ BlockSyncRemote.OnClientEvent:Connect(function(payload: {
 	_session.blockCtrl:setMeter(payload.meter, payload.isBroken)
 end)
 
--- Server telling THIS player their block was broken (explicit event, failsafe).
 BlockBrokenRemote.OnClientEvent:Connect(function()
 	if not _session then
 		return
@@ -227,7 +235,6 @@ BlockBrokenRemote.OnClientEvent:Connect(function()
 	_session.blockCtrl:setMeter(0, true)
 end)
 
--- Server syncing a parry that THIS player performed successfully.
 ParrySuccessRemote.OnClientEvent:Connect(function()
 	if not _session then
 		return
@@ -238,52 +245,145 @@ ParrySuccessRemote.OnClientEvent:Connect(function()
 	end
 end)
 
--- Server forcing our state (e.g., stunned, death authorised).
-StateSyncRemote.OnClientEvent:Connect(function(newState: string, duration: number?)
+StateSyncRemote.OnClientEvent:Connect(function(newState: string, duration: number?, effectType: string?)
 	if not _session then
 		return
 	end
 	local sm = _session.stateMachine
+	local humanoid = _session.humanoid
 
 	if newState == "Stunned" then
 		sm:forceTransition("Stunned")
+
+		if humanoid then
+			humanoid.WalkSpeed = 0
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		end
+
 		if _session.animCtrl then
 			_session.animCtrl:play(CombatConfig.ANIM.STUNNED, 0.05)
 		end
+
+		if effectType == "parried" then
+			ScreenEffects.parryBW(duration or CombatConfig.PARRY_BW_DURATION)
+		end
+
 		if duration then
 			task.delay(duration, function()
 				if _session and sm:is("Stunned") then
 					sm:transition("Idle")
+					if humanoid then
+						humanoid.WalkSpeed = 16
+						humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+					end
 				end
 			end)
 		end
 	elseif newState == "Dead" then
 		sm:forceTransition("Dead")
 		InputController.setEnabled(false)
+		ScreenEffects.clearAll()
+		if humanoid then
+			humanoid.WalkSpeed = 0
+		end
 	elseif newState == "Idle" then
 		if not sm:is("Dead") then
 			sm:forceTransition("Idle")
 		end
+		if humanoid then
+			humanoid.WalkSpeed = 16
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		end
+	end
+end)
+
+-- ─── RAGDOLL EVENTS ──────────────────────────────────────────────────────────
+
+RagdollStartRemote.OnClientEvent:Connect(function(knockback: Vector3)
+	if not _session then
+		return
+	end
+	local humanoid = _session.humanoid
+	local hrp = _session.hrp
+
+	if humanoid then
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+		humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		humanoid.WalkSpeed = 0
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+	end
+
+	if hrp then
+		hrp.AssemblyLinearVelocity = knockback
+	end
+end)
+
+RagdollEndRemote.OnClientEvent:Connect(function()
+	if not _session then
+		return
+	end
+	local humanoid = _session.humanoid
+
+	if humanoid then
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		humanoid.WalkSpeed = 16
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+	end
+
+	if _session and _session.stateMachine:is("Stunned") then
+		_session.stateMachine:transition("Idle")
+	end
+end)
+
+-- ─── FLOAT EVENTS ────────────────────────────────────────────────────────────
+
+FloatStartRemote.OnClientEvent:Connect(function(_duration: number)
+	if not _session then
+		return
+	end
+	local humanoid = _session.humanoid
+
+	if humanoid then
+		humanoid.WalkSpeed = 0
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+		humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+	end
+end)
+
+FloatEndRemote.OnClientEvent:Connect(function()
+	if not _session then
+		return
+	end
+	local humanoid = _session.humanoid
+
+	if humanoid then
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		humanoid.WalkSpeed = 16
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+	end
+
+	if _session and _session.stateMachine:is("Stunned") then
+		_session.stateMachine:transition("Idle")
 	end
 end)
 
 -- ─── CHARACTER LIFECYCLE ─────────────────────────────────────────────────────
 
 local function onCharacterAdded(character: Model)
-	-- Wait for the character to fully load (HRP must exist before animation)
 	character:WaitForChild("HumanoidRootPart", 5)
 	character:WaitForChild("Humanoid", 5)
-
 	initSession(character)
 	InputController.setEnabled(true)
 end
 
 local function onCharacterRemoving()
 	InputController.setEnabled(false)
-	-- Session cleaned up in next onCharacterAdded call
+	ScreenEffects.clearAll()
 end
 
--- Handle already-spawned character on script init
 if LocalPlayer.Character then
 	task.spawn(onCharacterAdded, LocalPlayer.Character)
 end

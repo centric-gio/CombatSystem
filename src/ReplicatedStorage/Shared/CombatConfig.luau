@@ -126,4 +126,19 @@ CombatConfig.BLOCK_BROKEN_FLASH_COLOR = Color3.fromRGB(255, 55, 55)
 CombatConfig.PARRY_FLASH_COLOR = Color3.fromRGB(255, 235, 80)
 CombatConfig.BLOCK_LOW_THRESHOLD = 30 -- meter % below which bar turns red
 
+-- ── Ragdoll (finisher hit 4, non-air) ────────────────────
+CombatConfig.RAGDOLL_DURATION = 1.50 -- seconds body stays ragdolled
+-- Local-space velocity applied to attacker's HRP on ragdoll hit.
+-- X = side, Y = up, Z = back (negative Z = away from attacker)
+CombatConfig.RAGDOLL_VELOCITY = Vector3.new(0, 10, -35)
+
+-- ── Air Combo ─────────────────────────────────────────────
+-- Space held during hits 1–3 → hit 4 launches up instead of ragdolling.
+CombatConfig.AIR_FLOAT_HEIGHT = 10 -- extra studs above hit position
+CombatConfig.AIR_FLOAT_DURATION = 3.50 -- seconds target is suspended
+CombatConfig.AIR_LAUNCH_VELOCITY = 70 -- upward studs/s impulse on launch
+
+-- ── Screen FX ─────────────────────────────────────────────
+CombatConfig.PARRY_BW_DURATION = 1.60 -- seconds of B&W effect on the parried player
+
 return CombatConfig
