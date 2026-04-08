@@ -20,9 +20,9 @@ local ANIM = {
 	COMBO_2 = "rbxassetid://0000000002",
 	COMBO_3 = "rbxassetid://0000000003",
 	COMBO_4 = "rbxassetid://0000000004", -- finisher
-	BLOCK_IDLE = "rbxassetid://0000000005",
-	STUNNED = "rbxassetid://0000000006",
-	BLOCK_BROKEN = "rbxassetid://0000000007",
+	BLOCK_IDLE = "rbxassetid://83146853780823",
+	STUNNED = "rbxassetid://100679173821281",
+	BLOCK_BROKEN = "rbxassetid://91395768560395",
 }
 
 -- ─── MODULE ──────────────────────────────────────────────────────────────────
