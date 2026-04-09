@@ -26,11 +26,11 @@ local Camera = workspace.CurrentCamera
 
 -- ─── SOUND IDS ── TODO: replace with real asset IDs ─────────────────────────
 local SOUND = {
-	WHOOSH = "rbxassetid://0000000010",
-	HIT = "rbxassetid://0000000011",
-	BLOCK = "rbxassetid://0000000012",
-	PARRY = "rbxassetid://0000000013",
-	BLOCK_BREAK = "rbxassetid://0000000014",
+	WHOOSH = "rbxassetid://139731037802687",
+	HIT = "rbxassetid://139890294541073",
+	BLOCK = "rbxassetid://136811265205147",
+	PARRY = "rbxassetid://116964347071838",
+	BLOCK_BREAK = "rbxassetid://85805517776968",
 }
 
 -- ─── MODULE ──────────────────────────────────────────────────────────────────
