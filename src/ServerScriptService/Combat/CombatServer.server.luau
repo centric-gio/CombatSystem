@@ -1,6 +1,11 @@
 --[[
-    CombatServer.server.luau  v2
-    Creates all remotes including ragdoll/float, inits CombatManager.
+    CombatServer.server.luau  v3
+    ──────────────────────────────────────────────────────────
+    CHANGES FROM v2:
+      • Added AttackerFloat RemoteEvent (Server → attacker client).
+        This fires when the attacker's air-combo launcher connects,
+        telling their client to apply an upward velocity boost so
+        they visually "jump" with the target.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -29,14 +34,16 @@ local Remotes = {
 	ParrySuccess = makeRemote("ParrySuccess"),
 	StateSync = makeRemote("StateSync"),
 
-	-- Server → Client: ragdoll + air float
+	-- Server → Client: ragdoll + air float (target)
 	RagdollStart = makeRemote("RagdollStart"),
 	RagdollEnd = makeRemote("RagdollEnd"),
 	FloatStart = makeRemote("FloatStart"),
 	FloatEnd = makeRemote("FloatEnd"),
+
+	-- Server → Client: attacker air boost (NEW)
+	AttackerFloat = makeRemote("AttackerFloat"),
 }
 
--- Init CombatManager — this also calls RagdollService.init() internally.
 CombatManager.init({
 	HitConfirmed = Remotes.HitConfirmed,
 	BlockSync = Remotes.BlockSync,
@@ -47,6 +54,7 @@ CombatManager.init({
 	RagdollEnd = Remotes.RagdollEnd,
 	FloatStart = Remotes.FloatStart,
 	FloatEnd = Remotes.FloatEnd,
+	AttackerFloat = Remotes.AttackerFloat,
 })
 
 Remotes.AttackRequest.OnServerEvent:Connect(
@@ -65,4 +73,4 @@ Remotes.BlockState.OnServerEvent:Connect(function(player: Player, isBlocking: bo
 	CombatManager.handleBlockState(player, isBlocking)
 end)
 
-print("[CombatServer] All remotes created. RagdollStart/End + FloatStart/End included.")
+print("[CombatServer] v3 ready. AttackerFloat remote included.")

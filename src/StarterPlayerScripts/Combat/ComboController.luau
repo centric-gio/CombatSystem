@@ -1,13 +1,12 @@
 --[[
-    ComboController.luau  (Client)
+    ComboController.luau  (Client)  v3
     ──────────────────────────────────────────────────────────
-    v2 changes vs v1:
-      • Tracks _airComboArmed: space held during hits 1–3 arms
-        the 4th M1 as an air launcher instead of a knockback finisher.
-      • Space state is checked BOTH via signal (held during swing)
-        and via UserInputService poll (pre-held before each hit).
-      • Disables jump (SetStateEnabled) while any action is active.
-      • AttackRequest payload now includes isAirCombo: boolean.
+    CHANGES FROM v2:
+      • COMBO_COUNT is now 5. Logic unchanged — just follows the config.
+      • Air combo arm now covers hits 1–4 (previously 1–3).
+      • Tool gate: CombatClient passes `isToolEquipped` function ref.
+        Every handleAttackInput call checks this first.
+        This is the ONLY client-side gate — server validates separately.
 ]]
 
 local UserInputService = game:GetService("UserInputService")
@@ -29,20 +28,25 @@ export type ComboControllerType = {
 	update: (self: ComboControllerType, dt: number) -> (),
 	reset: (self: ComboControllerType) -> (),
 	destroy: (self: ComboControllerType) -> (),
+	_comboIndex: number, -- exposed for HitEffects shake lookup
 }
 
-function ComboController.new(deps: {
-	stateMachine: SM,
-	animController: { play: any, stop: any },
-	attackRemote: RemoteEvent,
-	humanoidRef: Humanoid?,
-	onHitEffectRequest: ((comboIndex: number) -> ())?,
-}): ComboControllerType
+function ComboController.new(
+	deps: {
+		stateMachine: SM,
+		animController: { play: any, stop: any },
+		attackRemote: RemoteEvent,
+		humanoidRef: Humanoid?,
+		isToolEquipped: () -> boolean, -- NEW: gate function
+		onHitEffectRequest: ((comboIndex: number) -> ())?,
+	}
+): ComboControllerType
 	local self = setmetatable({
 		_sm = deps.stateMachine,
 		_anim = deps.animController,
 		_attackRemote = deps.attackRemote,
 		_humanoid = deps.humanoidRef,
+		_toolGate = deps.isToolEquipped,
 		_onHitEffect = deps.onHitEffectRequest,
 
 		_comboIndex = 0,
@@ -52,18 +56,14 @@ function ComboController.new(deps: {
 		_actionTimer = 0,
 		_resetTimer = 0,
 		_currentHit = nil :: ComboHit?,
-
-		-- Air combo: armed when space is held during hits 1–3.
-		-- Resets when the full combo resets.
 		_airComboArmed = false,
 
 		_connections = {} :: { RBXScriptConnection },
 	}, ComboController)
 
-	-- ── Wire space signal ─────────────────────────────────
-	-- Arm mid-swing: if space is held while the action is active on hits 1–3.
+	-- Arm air combo when Space is held during hits 1–4
 	local spaceConn = InputController.onSpaceHold:Connect(function()
-		if self._actionActive and self._comboIndex < CombatConfig.COMBO_COUNT and self._comboIndex >= 1 then
+		if self._actionActive and self._comboIndex >= 1 and self._comboIndex < CombatConfig.COMBO_COUNT then
 			self._airComboArmed = true
 		end
 	end)
@@ -75,6 +75,11 @@ end
 -- ─── PUBLIC ──────────────────────────────────────────────────────────────────
 
 function ComboController:handleAttackInput()
+	-- Tool gate: client rejects input before even reaching state machine
+	if not self._toolGate() then
+		return
+	end
+
 	local sm = self._sm
 	if sm:is("Blocking") or sm:is("BlockStun") or sm:is("Stunned") or sm:is("Dead") then
 		return
@@ -121,9 +126,8 @@ function ComboController:reset()
 	self._actionTimer = 0
 	self._resetTimer = 0
 	self._currentHit = nil
-	self._airComboArmed = false -- full reset clears air combo arm
+	self._airComboArmed = false
 
-	-- Restore jump when combo resets manually (safety net)
 	if self._humanoid then
 		self._humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 	end
@@ -143,9 +147,7 @@ function ComboController:_startNextHit()
 	local nextIndex = (self._comboIndex % CombatConfig.COMBO_COUNT) + 1
 	local hit = CombatConfig.COMBO_HITS[nextIndex] :: ComboHit
 
-	-- Poll space RIGHT NOW for pre-held case:
-	-- Player may have held space before pressing M1 for this hit.
-	-- Only arms for hits 1–3 (not 4, which IS the launcher).
+	-- Pre-poll space for hits 1–4
 	if nextIndex < CombatConfig.COMBO_COUNT then
 		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
 			self._airComboArmed = true
@@ -160,22 +162,16 @@ function ComboController:_startNextHit()
 	self._resetTimer = 0
 	self._currentHit = hit
 
-	-- ── Disable jump while swinging ──────────────────────
-	-- Prevents bunny-hopping through combos.
-	-- Re-enabled in _endAction (or on full reset).
 	if self._humanoid then
 		self._humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
 	end
 
-	-- ── Client Prediction ────────────────────────────────
 	self._anim:play(hit.animationId, 0.05)
 
 	if not self._sm:transition("Attacking") then
 		self._sm:forceTransition("Attacking")
 	end
 
-	-- ── Server Request ───────────────────────────────────
-	-- isAirCombo is only meaningful on hit 4; server ignores it for hits 1–3.
 	self._attackRemote:FireServer({
 		comboIndex = nextIndex,
 		clientTime = tick(),
@@ -193,12 +189,10 @@ function ComboController:_endAction()
 	self._actionTimer = 0
 	self._currentHit = nil
 
-	-- Restore jump now that the swing has fully recovered.
 	if self._humanoid then
 		self._humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 	end
 
-	-- Air combo arm resets after hit 4 fires; keep it through hits 1–3.
 	if self._comboIndex >= CombatConfig.COMBO_COUNT then
 		self._airComboArmed = false
 	end

@@ -1,31 +1,35 @@
 --[[
-    RagdollService.luau  (Server)
+    RagdollService.luau  (Server)  v3 — R6 + Attacker Air Boost
     ──────────────────────────────────────────────────────────
-    Handles two physics-driven reactions to hit 4:
+    CHANGES FROM v2:
+      • R6 joint support: skips "RootJoint" and "Root" (HRP↔LowerTorso
+        equivalent in R6 is the root motor). For R6, the joints are:
+            Neck            (Head ↔ Torso)
+            Left Shoulder   (Torso ↔ Left Arm)
+            Right Shoulder  (Torso ↔ Right Arm)
+            Left Hip        (Torso ↔ Left Leg)
+            Right Hip       (Torso ↔ Right Leg)
+        All of these become BallSocketConstraints during ragdoll.
 
-    RAGDOLL  (normal finisher)
-      • Creates BallSocketConstraints at every Motor6D joint.
-      • Disables Motor6Ds → parts become loose but stay connected.
-      • Fires RagdollStart to the target client: client applies
-        velocity impulse and changes Humanoid state to Physics.
-      • Auto-unragdolls after RAGDOLL_DURATION.
+      • Air combo float REWORKED:
+          1. Target gets upward impulse (AIR_LAUNCH_VELOCITY).
+          2. Server fires AttackerFloat remote → attacker's CLIENT
+             applies their own upward boost (ATTACKER_AIR_BOOST)
+             so they visually "jump" with the target.
+          3. After 0.15s, AlignPosition is created on the TARGET
+             (same as before) so they float in place.
+          4. Ragdoll joints are built on the target so they tumble
+             in place mid-air (floppy feel while suspended).
+          5. On FloatEnd: ragdoll joints cleared, target recovers.
 
-    FLOAT  (air combo finisher)
-      • Fires a large upward velocity impulse via RagdollStart (velocity only).
-      • After 0.15 s (time for character to rise), creates an AlignPosition
-        on the server — replicated to ALL clients so everyone sees the float.
-      • Fires FloatStart to target client: they lock WalkSpeed and jump.
-      • Auto-unfloats after AIR_FLOAT_DURATION.
+      • Removed old choppy direct HRP velocity assignment from
+        within the float task.delay — moved to immediate application
+        before the delay so physics has time to react.
 
-    Architecture note:
-      Physics constraints (BallSocketConstraint, AlignPosition) are created on
-      the SERVER so they replicate to ALL observing clients automatically.
-      Only the Humanoid state change and velocity application are done on the
-      TARGET CLIENT (via remotes), because Humanoid state lives on the owning client.
-
-    Test dummy caveat:
-      Dummy parts are anchored — AlignPosition and ragdoll physics are a no-op
-      visually. Unanchor HRP in DummySpawner to test physics reactions.
+    Architecture reminder:
+      BallSocketConstraints live on the SERVER → replicate to all clients.
+      Humanoid state changes + velocity impulses fire to the TARGET client.
+      The AttackerFloat remote fires to the ATTACKER client.
 ]]
 
 local CombatConfig = require(game:GetService("ReplicatedStorage").Shared.CombatConfig)
@@ -38,6 +42,7 @@ type Remotes = {
 	RagdollEnd: RemoteEvent,
 	FloatStart: RemoteEvent,
 	FloatEnd: RemoteEvent,
+	AttackerFloat: RemoteEvent, -- NEW: tells the attacker to jump up
 }
 
 type FloatData = {
@@ -48,32 +53,37 @@ type FloatData = {
 
 local _remotes: Remotes = {} :: any
 
--- Track active floats so we don't double-launch a floating character.
+-- Track active floats per character
 local _activeFloats: { [Model]: FloatData } = {}
 
 function RagdollService.init(remotes: Remotes)
 	_remotes = remotes
 end
 
--- ─── INTERNAL: Joint helpers ──────────────────────────────────────────────────
+-- ─── INTERNAL: R6 Joint Helpers ──────────────────────────────────────────────
 
--- Iterates all Motor6D instances in the character and builds a BallSocket
--- constraint pair for each, then disables the motor.
--- We skip "RootJoint" (LowerTorso ↔ HumanoidRootPart) to keep the body
--- anchored to the HRP's world position — otherwise the whole character drifts.
+-- R6 root-joint name — must be skipped so the body doesn't fly apart
+local R6_ROOT_NAMES = {
+	["RootJoint"] = true, -- standard R6 root
+	["Root"] = true, -- sometimes named "Root"
+	["HumanoidRootPart"] = true,
+}
+
+--[[
+    Build BallSocketConstraints for every Motor6D in the character,
+    EXCEPT the root joint. This makes the character go limp while the
+    HRP stays anchored to its world position.
+]]
 local function _buildRagdollJoints(character: Model)
 	for _, desc in ipairs(character:GetDescendants()) do
 		if not desc:IsA("Motor6D") then
 			continue
 		end
 		local motor = desc :: Motor6D
-		if motor.Name == "RootJoint" then
+		if R6_ROOT_NAMES[motor.Name] then
 			continue
 		end
-		if not motor.Part0 then
-			continue
-		end
-		if not motor.Part1 then
+		if not motor.Part0 or not motor.Part1 then
 			continue
 		end
 
@@ -92,15 +102,14 @@ local function _buildRagdollJoints(character: Model)
 		bsc.Attachment0 = att0
 		bsc.Attachment1 = att1
 		bsc.LimitsEnabled = true
-		bsc.UpperAngle = 50 -- allows flailing but keeps limbs recognisable
+		bsc.UpperAngle = 55 -- R6 limbs need slightly more freedom
 		bsc.TwistLimitsEnabled = false
 		bsc.Parent = motor.Part0
 
-		motor.Enabled = false -- replicates to all clients immediately
+		motor.Enabled = false -- disabling replicates immediately
 	end
 end
 
--- Reverses _buildRagdollJoints: destroys constraints, re-enables motors.
 local function _clearRagdollJoints(character: Model)
 	for _, desc in ipairs(character:GetDescendants()) do
 		if desc:IsA("BallSocketConstraint") and desc.Name == "RgdBSC" then
@@ -108,27 +117,26 @@ local function _clearRagdollJoints(character: Model)
 		elseif desc:IsA("Attachment") and (desc.Name == "RgdAtt0" or desc.Name == "RgdAtt1") then
 			desc:Destroy()
 		elseif desc:IsA("Motor6D") then
-			desc.Enabled = true -- re-enable all motors
+			desc.Enabled = true
 		end
 	end
 end
 
 -- ─── PUBLIC: Ragdoll ──────────────────────────────────────────────────────────
---[[
-    ragdoll(character, targetPlayer, knockbackWorld)
-      character      – the target's character model
-      targetPlayer   – Player? (nil for NPCs)
-      knockbackWorld – world-space velocity Vector3 to apply on the client
-]]
 function RagdollService.ragdoll(character: Model, targetPlayer: Player?, knockbackWorld: Vector3)
 	_buildRagdollJoints(character)
 
-	-- Tell the target client: apply the knockback velocity and enter Physics state.
+	-- Apply the knockback velocity server-side so ALL clients see it.
+	-- Also tell the target client to enter Physics state.
+	local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if hrp then
+		hrp.AssemblyLinearVelocity = knockbackWorld
+	end
+
 	if targetPlayer then
 		_remotes.RagdollStart:FireClient(targetPlayer, knockbackWorld)
 	end
 
-	-- Auto-unragdoll after duration.
 	task.delay(CombatConfig.RAGDOLL_DURATION, function()
 		if not (character and character.Parent) then
 			return
@@ -144,31 +152,43 @@ function RagdollService.unragdoll(character: Model, targetPlayer: Player?)
 	end
 end
 
--- ─── PUBLIC: Air Float ────────────────────────────────────────────────────────
+-- ─── PUBLIC: Air Float (REWORKED) ────────────────────────────────────────────
 --[[
-    float(character, targetPlayer)
-      Launches the character upward then suspends them mid-air via AlignPosition.
-      The constraint is server-created → replicated to all clients.
-      Only the target client receives FloatStart for movement lock.
+    float(character, targetPlayer, attackerPlayer)
+      character      – target's character Model
+      targetPlayer   – Player? (nil for NPC targets — floats still work visually)
+      attackerPlayer – Player? who threw the launcher; they get the air boost
 ]]
-function RagdollService.float(character: Model, targetPlayer: Player?)
-	-- Guard: don't double-launch a character already in the air.
+function RagdollService.float(character: Model, targetPlayer: Player?, attackerPlayer: Player?)
 	if _activeFloats[character] then
 		return
-	end
+	end -- don't double-launch
 
 	local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart?
 	if not hrp then
 		return
 	end
 
-	-- Initial upward impulse — applied server-side.
-	-- Physics simulate on target client's machine (they own the character).
+	-- ── Step 1: Immediate upward impulse on target ────────
+	-- Applied SERVER-SIDE so physics runs on the network owner's machine.
+	-- The magnitude is high so the character visibly rises quickly.
 	hrp.AssemblyLinearVelocity = Vector3.new(0, CombatConfig.AIR_LAUNCH_VELOCITY, 0)
 
-	-- Wait for the character to rise before locking the height.
-	-- 0.15 s at ~70 studs/s ≈ 10.5 studs up — close to AIR_FLOAT_HEIGHT.
-	task.delay(0.15, function()
+	-- Also notify target client: Humanoid → Physics state (no gravity lock yet)
+	if targetPlayer then
+		_remotes.FloatStart:FireClient(targetPlayer, CombatConfig.AIR_FLOAT_DURATION)
+	end
+
+	-- ── Step 2: Attacker jumps up simultaneously ──────────
+	-- The attacker gets a smaller boost so they "chase" the target into the air.
+	-- This is CLIENT-SIDE only (attacker owns their character's physics).
+	if attackerPlayer then
+		_remotes.AttackerFloat:FireClient(attackerPlayer, CombatConfig.ATTACKER_AIR_BOOST)
+	end
+
+	-- ── Step 3: Lock target height with AlignPosition ─────
+	-- Wait 0.18s so the character has risen ~13 studs before we pin it.
+	task.delay(0.18, function()
 		if not (character and character.Parent) then
 			return
 		end
@@ -176,9 +196,9 @@ function RagdollService.float(character: Model, targetPlayer: Player?)
 			return
 		end
 
-		local suspendY = hrp.Position.Y + (CombatConfig.AIR_FLOAT_HEIGHT * 0.35)
+		-- Suspend at the character's current risen position.
+		local suspendY = hrp.Position.Y + (CombatConfig.AIR_FLOAT_HEIGHT * 0.2)
 
-		-- World-space anchor on Terrain (always exists, always accessible).
 		local worldAtt = Instance.new("Attachment")
 		worldAtt.Name = "FloatWorldAtt"
 		worldAtt.WorldPosition = Vector3.new(hrp.Position.X, suspendY, hrp.Position.Z)
@@ -188,16 +208,19 @@ function RagdollService.float(character: Model, targetPlayer: Player?)
 		hrpAtt.Name = "FloatHRPAtt"
 		hrpAtt.Parent = hrp
 
-		-- AlignPosition: pulls HRP toward worldAtt position with soft spring feel.
+		-- Soft spring feel: not rigid, but holds the character in the air
 		local align = Instance.new("AlignPosition")
 		align.Name = "FloatAlign"
 		align.Attachment0 = hrpAtt
 		align.Attachment1 = worldAtt
-		align.MaxForce = 55000
-		align.Responsiveness = 25 -- low = gentle bounce, not stiff lock
+		align.MaxForce = 65000
+		align.Responsiveness = 30 -- higher = snappier lock, less drift
 		align.ApplyAtCenterOfMass = true
-		align.ReactionForceEnabled = false -- don't push the world attachment
+		align.ReactionForceEnabled = false
 		align.Parent = hrp
+
+		-- Build ragdoll joints so the target flops around mid-air (juicy feel)
+		_buildRagdollJoints(character)
 
 		_activeFloats[character] = {
 			worldAtt = worldAtt,
@@ -205,13 +228,7 @@ function RagdollService.float(character: Model, targetPlayer: Player?)
 			align = align,
 		}
 
-		-- Tell the TARGET client to lock movement (visual is already handled by
-		-- AlignPosition replication, but the client needs to set WalkSpeed = 0).
-		if targetPlayer then
-			_remotes.FloatStart:FireClient(targetPlayer, CombatConfig.AIR_FLOAT_DURATION)
-		end
-
-		-- Schedule unfloat.
+		-- Auto-unfloat
 		task.delay(CombatConfig.AIR_FLOAT_DURATION, function()
 			RagdollService.unfloat(character, targetPlayer)
 		end)
@@ -232,6 +249,9 @@ function RagdollService.unfloat(character: Model, targetPlayer: Player?)
 		end
 		_activeFloats[character] = nil
 	end
+
+	-- Clear ragdoll joints that were built on float start
+	_clearRagdollJoints(character)
 
 	if targetPlayer then
 		_remotes.FloatEnd:FireClient(targetPlayer)
