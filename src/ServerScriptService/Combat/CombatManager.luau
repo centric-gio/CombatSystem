@@ -1,16 +1,20 @@
 --[[
-    CombatManager.luau  (Server)  v3
+    CombatManager.luau  (Server)  v4
     ──────────────────────────────────────────────────────────
-    CHANGES FROM v2:
-      • COMBO_COUNT is now 5. All hits are non-heavy (isHeavy removed).
-      • Ragdoll / float trigger: comboIndex == CombatConfig.COMBO_COUNT
-        (i.e., hit 5), NOT hitData.isHeavy. This removes the isHeavy
-        gating and makes the ragdoll purely positional in the combo.
-      • _processHit now receives attackerPlayer explicitly so we can
-        pass them to RagdollService.float as the attacker that gets
-        the air boost remote.
-      • RagdollService.float signature updated:
-          float(character, targetPlayer, attackerPlayer)
+    CHANGES FROM v3:
+
+    1. AIR COMBO FINISHER — NO RAGDOLL JOINTS
+       When isAirCombo=true on hit 5, we call RagdollService.float()
+       and nothing else. No _buildRagdollJoints, no ground knockback.
+       The target stays in pose, suspended mid-air.
+
+    2. GROUND FINISHER — RAGDOLL WITH KNOCKBACK (unchanged)
+       Hit 5 with isAirCombo=false → RagdollService.ragdoll() as before.
+
+    3. comboIndex passed through _processHit so HitConfirmed payload
+       always includes it (used by client for cameraShakeMagnitude lookup).
+
+    Everything else (block, parry, NPC path, regen) is unchanged from v3.
 ]]
 
 local Players = game:GetService("Players")
@@ -44,7 +48,6 @@ type NPCCombatData = {
 	onHit: ((damage: number) -> ())?,
 }
 
--- ─── MODULE ──────────────────────────────────────────────────────────────────
 local CombatManager = {}
 
 local _playerData: { [Player]: PlayerData } = {}
@@ -76,13 +79,13 @@ function CombatManager.init(remotes: typeof(_remotes))
 		AttackerFloat = remotes.AttackerFloat,
 	})
 
-	for _, player in ipairs(Players:GetPlayers()) do
-		CombatManager.onPlayerAdded(player)
+	for _, p in ipairs(Players:GetPlayers()) do
+		CombatManager.onPlayerAdded(p)
 	end
 	Players.PlayerAdded:Connect(CombatManager.onPlayerAdded)
 	Players.PlayerRemoving:Connect(CombatManager.onPlayerRemoving)
 
-	-- Block regen loop: runs every 0.5s (cheap)
+	-- Block regen every 0.5s
 	task.spawn(function()
 		while true do
 			task.wait(0.5)
@@ -100,7 +103,6 @@ function CombatManager.init(remotes: typeof(_remotes))
 				if data.stateMachine:is("Blocking") then
 					continue
 				end
-
 				local newMeter =
 					math.min(data.blockMeter + CombatConfig.BLOCK_REGEN_RATE * 0.5, CombatConfig.BLOCK_MAX_METER)
 				if newMeter ~= data.blockMeter then
@@ -180,7 +182,6 @@ function CombatManager.handleAttackRequest(
 		return
 	end
 
-	-- Rate limit
 	local now = os.clock()
 	if (now - attackerData.lastAttackTime) < CombatConfig.MIN_ATTACK_INTERVAL then
 		warn(("[CombatManager] Rate limit: %s"):format(attacker.Name))
@@ -188,13 +189,11 @@ function CombatManager.handleAttackRequest(
 	end
 	attackerData.lastAttackTime = now
 
-	-- State check
 	local sm = attackerData.stateMachine
 	if sm:is("Stunned") or sm:is("Dead") or sm:is("Blocking") then
 		return
 	end
 
-	-- Validate combo index
 	local comboIndex = payload.comboIndex
 	if type(comboIndex) ~= "number" or comboIndex < 1 or comboIndex > CombatConfig.COMBO_COUNT then
 		warn(("[CombatManager] Invalid comboIndex %s from %s"):format(tostring(comboIndex), attacker.Name))
@@ -210,16 +209,13 @@ function CombatManager.handleAttackRequest(
 		sm:transition("Attacking")
 	end
 
-	local hits = HitboxService.cast(attackerChar, hitData.hitboxSize, hitData.hitboxOffset)
-
-	-- isAirCombo is only valid on the LAST hit (hit 5)
 	local isAirCombo = (payload.isAirCombo == true) and (comboIndex == CombatConfig.COMBO_COUNT)
+	local hits = HitboxService.cast(attackerChar, hitData.hitboxSize, hitData.hitboxOffset)
 
 	for _, candidate in ipairs(hits) do
 		CombatManager._processHit(attacker, attackerData, candidate, hitData, comboIndex, isAirCombo)
 	end
 
-	-- Return attacker to Idle after action recovery
 	task.delay(hitData.totalDuration, function()
 		if _playerData[attacker] == attackerData and sm:is("Attacking") then
 			sm:transition("Idle")
@@ -239,18 +235,15 @@ function CombatManager._processHit(
 )
 	isAirCombo = isAirCombo == true
 	local now = os.clock()
+	local isFinisher = (comboIndex == CombatConfig.COMBO_COUNT)
 	local wasBlocked = false
 	local wasParried = false
 	local blockBroken = false
 	local damageToDeal = hitData.damage
 
-	-- ── Is this the finisher hit? ─────────────────────────
-	-- Ragdoll/float is triggered on hit 5, regardless of isHeavy.
-	local isFinisher = (comboIndex == CombatConfig.COMBO_COUNT)
-
-	-- ─────────────────────────────────────────────────────────
+	-- ────────────────────────────────────────────────────
 	-- BRANCH A: Player target
-	-- ─────────────────────────────────────────────────────────
+	-- ────────────────────────────────────────────────────
 	if candidate.player then
 		local targetPlayer = candidate.player
 		local targetData = _playerData[targetPlayer]
@@ -263,11 +256,10 @@ function CombatManager._processHit(
 			return
 		end
 
-		-- Parry / block check
+		-- Parry / block
 		if targetSM:is("Blocking") and not targetData.blockBroken then
 			local timeSince = now - targetData.blockStartTime
 
-			-- Parry window check — works on ALL hits (no isHeavy exclusion)
 			if timeSince <= CombatConfig.BLOCK_PARRY_WINDOW then
 				wasParried = true
 				if attacker then
@@ -276,7 +268,6 @@ function CombatManager._processHit(
 				return
 			end
 
-			-- Regular block
 			wasBlocked = true
 			damageToDeal = math.ceil(hitData.damage * CombatConfig.BLOCK_DAMAGE_MULT)
 			targetData.lastHitTime = now
@@ -318,17 +309,17 @@ function CombatManager._processHit(
 
 		candidate.humanoid:TakeDamage(damageToDeal)
 
-		-- ── Finisher (hit 5): ragdoll OR air float ─────────
+		-- ── Hit 5 finisher ────────────────────────────────
 		if isFinisher and not wasBlocked and not wasParried then
 			local attackerChar = attacker and attacker.Character
 			local aHRP = attackerChar and attackerChar:FindFirstChild("HumanoidRootPart") :: BasePart?
 
 			if isAirCombo then
-				-- Air combo: target floats, attacker gets air boost
+				-- AIR: suspend target, Y-lock attacker — NO ragdoll joints
 				targetSM:forceTransition("Stunned")
 				RagdollService.float(candidate.character, targetPlayer, attacker)
 			else
-				-- Ground finisher: ragdoll with knockback
+				-- GROUND: ragdoll with knockback
 				local worldKB = aHRP and aHRP.CFrame:VectorToWorldSpace(CombatConfig.RAGDOLL_VELOCITY)
 					or CombatConfig.RAGDOLL_VELOCITY
 				targetSM:forceTransition("Stunned")
@@ -336,13 +327,12 @@ function CombatManager._processHit(
 			end
 		end
 
-		-- Regular knockback for hits 1–4 (and blocked finisher)
-		if not isFinisher or wasBlocked then
+		-- Regular knockback for hits 1–4 (or blocked finisher)
+		if (not isFinisher or wasBlocked) and not wasParried then
 			local attackerChar = attacker and attacker.Character
 			local aHRP = attackerChar and attackerChar:FindFirstChild("HumanoidRootPart") :: BasePart?
-			if aHRP then
-				local worldKB = aHRP.CFrame:VectorToWorldSpace(hitData.knockback)
-				candidate.hrp.AssemblyLinearVelocity = worldKB
+			if aHRP and not candidate.hrp.Anchored then
+				candidate.hrp.AssemblyLinearVelocity = aHRP.CFrame:VectorToWorldSpace(hitData.knockback)
 			end
 		end
 
@@ -361,9 +351,9 @@ function CombatManager._processHit(
 		return
 	end
 
-	-- ─────────────────────────────────────────────────────────
+	-- ────────────────────────────────────────────────────
 	-- BRANCH B: NPC target
-	-- ─────────────────────────────────────────────────────────
+	-- ────────────────────────────────────────────────────
 	local npcData = _npcData[candidate.character]
 	if not npcData then
 		return
@@ -408,6 +398,19 @@ function CombatManager._processHit(
 		end
 	end
 
+	-- Finisher on NPC: air float (no ragdoll, anchored handled by RagdollService)
+	if isFinisher and not wasBlocked and not wasParried then
+		if isAirCombo then
+			RagdollService.float(candidate.character, nil, attacker)
+		else
+			local attackerChar = attacker and attacker.Character
+			local aHRP = attackerChar and attackerChar:FindFirstChild("HumanoidRootPart") :: BasePart?
+			local worldKB = aHRP and aHRP.CFrame:VectorToWorldSpace(CombatConfig.RAGDOLL_VELOCITY)
+				or CombatConfig.RAGDOLL_VELOCITY
+			RagdollService.ragdoll(candidate.character, nil, worldKB)
+		end
+	end
+
 	candidate.humanoid:TakeDamage(damageToDeal)
 	if npcData.onHit then
 		npcData.onHit(damageToDeal)
@@ -437,7 +440,6 @@ function CombatManager._applyParry(attacker: Player, defender: Player?)
 
 	local sm = attackerData.stateMachine
 	sm:forceTransition("Stunned")
-
 	_remotes.StateSync:FireClient(attacker, "Stunned", CombatConfig.PARRY_STUN_DURATION, "parried")
 	if defender then
 		_remotes.ParrySuccess:FireClient(defender)
@@ -471,7 +473,7 @@ function CombatManager.handleBlockState(player: Player, isBlocking: boolean)
 	end
 end
 
--- ─── NPC PUBLIC API ──────────────────────────────────────────────────────────
+-- ─── NPC API ─────────────────────────────────────────────────────────────────
 
 function CombatManager.registerNPC(
 	character: Model,
@@ -528,7 +530,6 @@ function CombatManager.npcAttack(attackerCharacter: Model, comboIndex: number)
 	if not hitData then
 		return
 	end
-
 	local hits = HitboxService.cast(attackerCharacter, hitData.hitboxSize, hitData.hitboxOffset)
 	for _, candidate in ipairs(hits) do
 		if not candidate.player then

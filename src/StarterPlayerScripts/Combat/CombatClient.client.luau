@@ -1,25 +1,41 @@
 --[[
-    CombatClient.client.luau  v4
+    CombatClient.client.luau  v5
     ──────────────────────────────────────────────────────────
-    CHANGES FROM v3:
-      • Tool gate: M1 attacks only fire when CombatConfig.TOOL_NAME
-        is actively equipped. Detects via character ChildAdded/Removed
-        listening for Tool with matching Name.
-      • DebugMenu integrated: updates every Heartbeat with live state,
-        logs every server event.
-      • HitCounter integrated: left-side hit counter, incremented on
-        every HitConfirmed. Streak resets when combo resets.
-      • AttackerFloat remote: when the LOCAL player lands an air-combo
-        finisher, they receive this remote and apply an upward velocity
-        impulse so they visually "chase" the target into the air.
-      • ComboController.new() now receives isToolEquipped gate function.
+    CHANGES FROM v4:
+
+    1. NPC HIT EFFECTS FIXED
+       Previously onHitConfirmed was only called when targetChar was
+       non-nil, which requires targetUserId != 0. NPC hits send
+       targetUserId=0 so targetChar was never found, silencing all
+       sound and VFX for dummies. Now:
+         • VFX + sound always fire using result.position.
+         • hitFlash only fires when targetChar is available.
+         • cameraShake fires regardless.
+
+    2. ATTACKER Y-LOCK (AlignPosition on client)
+       When AttackerFloat fires with phase="ylock", we create an
+       AlignPosition on the LOCAL character's HRP that holds only Y
+       (achieved by setting the world attachment at the target Y
+       while allowing XZ drift via low MaxForce on XZ axes — in
+       practice we use a single AlignPosition + lock the Y component
+       by positioning the world anchor exactly at character X,Z).
+       Destroyed on FloatEnd or after duration.
+
+       When phase="boost", we apply immediate upward velocity so the
+       attacker rises at the same moment as the target.
+
+    3. ParrySuccess VFX now passes attacker position so the parry
+       golden ring appears at a sensible world position.
+
+    4. All other systems (tool gate, debug menu, hit counter,
+       state sync, ragdoll) unchanged from v4.
 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Script = script -- must be declared before sibling requires
+local Script = script
 
 -- ── Shared ────────────────────────────────────────────────
 local StateMachine = require(ReplicatedStorage.Shared.StateMachine)
@@ -38,7 +54,7 @@ local HitCounter = require(Script.Parent.HitCounter)
 
 local LocalPlayer = Players.LocalPlayer
 
--- ─── REMOTE REFERENCES ───────────────────────────────────────────────────────
+-- ─── REMOTES ─────────────────────────────────────────────────────────────────
 local CombatRemotes = ReplicatedStorage:WaitForChild("CombatRemotes", 10)
 assert(CombatRemotes, "[CombatClient] CombatRemotes folder not found!")
 
@@ -53,16 +69,23 @@ local RagdollStartRemote = CombatRemotes:WaitForChild("RagdollStart") :: RemoteE
 local RagdollEndRemote = CombatRemotes:WaitForChild("RagdollEnd") :: RemoteEvent
 local FloatStartRemote = CombatRemotes:WaitForChild("FloatStart") :: RemoteEvent
 local FloatEndRemote = CombatRemotes:WaitForChild("FloatEnd") :: RemoteEvent
-local AttackerFloatRemote = CombatRemotes:WaitForChild("AttackerFloat") :: RemoteEvent -- NEW
+local AttackerFloatRemote = CombatRemotes:WaitForChild("AttackerFloat") :: RemoteEvent
 
--- ─── GLOBAL SINGLETONS (persist across respawns) ─────────────────────────────
--- DebugMenu and HitCounter are not destroyed on respawn.
+-- ─── SINGLETONS (persist across respawns) ────────────────────────────────────
 local _debugMenu = DebugMenu.new()
 local _hitCounter = HitCounter.new()
 
--- ─── SESSION TYPE ────────────────────────────────────────────────────────────
+-- ─── SESSION ─────────────────────────────────────────────────────────────────
 type CombatSession = {
-	stateMachine: { is: any, transition: any, forceTransition: any, update: any, onChanged: any, destroy: any },
+	stateMachine: {
+		is: any,
+		transition: any,
+		forceTransition: any,
+		update: any,
+		getState: any,
+		onChanged: any,
+		destroy: any,
+	},
 	animCtrl: { play: any, stop: any, stopAll: any, destroy: any },
 	comboCtrl: {
 		handleAttackInput: any,
@@ -80,21 +103,21 @@ type CombatSession = {
 	toolConn1: RBXScriptConnection?,
 	toolConn2: RBXScriptConnection?,
 	toolEquipped: boolean,
+	-- Attacker air-lock constraint (created client-side on AttackerFloat ylock)
+	attackerAlign: AlignPosition?,
+	attackerWorldAtt: Attachment?,
+	attackerHRPAtt: Attachment?,
 }
 
 local _session: CombatSession? = nil
 
--- ─── TOOL GATE HELPERS ───────────────────────────────────────────────────────
--- Returns true if the local character has the combat tool currently equipped.
--- "Equipped" in Roblox terms = the Tool is a child of the Character, not the Backpack.
+-- ─── TOOL GATE ───────────────────────────────────────────────────────────────
+
 local function isToolEquipped(): boolean
-	if not _session then
-		return false
-	end
-	return _session.toolEquipped
+	return _session ~= nil and _session.toolEquipped
 end
 
-local function _detectToolInCharacter(character: Model): boolean
+local function _detectTool(character: Model): boolean
 	for _, child in ipairs(character:GetChildren()) do
 		if child:IsA("Tool") and child.Name == CombatConfig.TOOL_NAME then
 			return true
@@ -104,7 +127,6 @@ local function _detectToolInCharacter(character: Model): boolean
 end
 
 local function _setupToolListeners(character: Model, session: CombatSession)
-	-- Disconnect previous listeners if any
 	if session.toolConn1 then
 		session.toolConn1:Disconnect()
 	end
@@ -112,8 +134,7 @@ local function _setupToolListeners(character: Model, session: CombatSession)
 		session.toolConn2:Disconnect()
 	end
 
-	-- Initial check
-	session.toolEquipped = _detectToolInCharacter(character)
+	session.toolEquipped = _detectTool(character)
 
 	session.toolConn1 = character.ChildAdded:Connect(function(child)
 		if child:IsA("Tool") and child.Name == CombatConfig.TOOL_NAME then
@@ -125,8 +146,7 @@ local function _setupToolListeners(character: Model, session: CombatSession)
 	session.toolConn2 = character.ChildRemoved:Connect(function(child)
 		if child:IsA("Tool") and child.Name == CombatConfig.TOOL_NAME then
 			session.toolEquipped = false
-			_debugMenu:logEvent("STATE", "Tool UNEQUIPPED — interrupting combo")
-			-- Interrupt any active combo when tool is put away
+			_debugMenu:logEvent("STATE", "Tool UNEQUIPPED")
 			if _session then
 				_session.comboCtrl:reset()
 				if _session.stateMachine:is("Attacking") then
@@ -137,7 +157,69 @@ local function _setupToolListeners(character: Model, session: CombatSession)
 	end)
 end
 
+-- ─── ATTACKER Y-LOCK HELPERS ─────────────────────────────────────────────────
+
+local function _clearAttackerAlign(session: CombatSession)
+	if session.attackerAlign and session.attackerAlign.Parent then
+		session.attackerAlign:Destroy()
+	end
+	if session.attackerHRPAtt and session.attackerHRPAtt.Parent then
+		session.attackerHRPAtt:Destroy()
+	end
+	if session.attackerWorldAtt and session.attackerWorldAtt.Parent then
+		session.attackerWorldAtt:Destroy()
+	end
+	session.attackerAlign = nil
+	session.attackerHRPAtt = nil
+	session.attackerWorldAtt = nil
+end
+
+local function _applyAttackerYLock(session: CombatSession, suspendY: number, duration: number)
+	_clearAttackerAlign(session) -- clear any stale constraint
+
+	local hrp = session.hrp
+	if not hrp then
+		return
+	end
+
+	-- World attachment: placed at the attacker's current XZ but at suspendY
+	-- so AlignPosition pulls them to that Y without fighting horizontal movement
+	local worldAtt = Instance.new("Attachment")
+	worldAtt.Name = "AttackerFloatWorldAtt"
+	worldAtt.WorldPosition = Vector3.new(hrp.Position.X, suspendY, hrp.Position.Z)
+	worldAtt.Parent = workspace.Terrain
+
+	local hrpAtt = Instance.new("Attachment")
+	hrpAtt.Name = "AttackerFloatHRPAtt"
+	hrpAtt.Parent = hrp
+
+	local align = Instance.new("AlignPosition")
+	align.Name = "AttackerFloatAlign"
+	align.Attachment0 = hrpAtt
+	align.Attachment1 = worldAtt
+	-- Low MaxForce: just enough to counteract gravity on Y (≈ mass * 196.2)
+	-- but NOT so high that it fights horizontal movement significantly.
+	-- For a 16-unit humanoid mass this is ~3136. Use 6000 for headroom.
+	align.MaxForce = 6000
+	align.Responsiveness = 40
+	align.ApplyAtCenterOfMass = true
+	align.ReactionForceEnabled = false
+	align.Parent = hrp
+
+	session.attackerAlign = align
+	session.attackerWorldAtt = worldAtt
+	session.attackerHRPAtt = hrpAtt
+
+	-- Auto-destroy after duration (server also sends FloatEnd, but this is a fallback)
+	task.delay(duration + 0.3, function()
+		if _session and _session.attackerAlign == align then
+			_clearAttackerAlign(_session)
+		end
+	end)
+end
+
 -- ─── STATE MACHINE BUILDER ───────────────────────────────────────────────────
+
 local function buildStateMachine()
 	return StateMachine.new("Idle", {
 		Idle = { canTransitionTo = { "Attacking", "Blocking", "Stunned", "Dead" } },
@@ -150,6 +232,7 @@ local function buildStateMachine()
 end
 
 -- ─── INIT SESSION ────────────────────────────────────────────────────────────
+
 local function initSession(character: Model)
 	if _session then
 		_session.heartbeatConn:Disconnect()
@@ -159,6 +242,7 @@ local function initSession(character: Model)
 		if _session.toolConn2 then
 			_session.toolConn2:Disconnect()
 		end
+		_clearAttackerAlign(_session)
 		_session.stateMachine:destroy()
 		_session.animCtrl:destroy()
 		_session.comboCtrl:destroy()
@@ -174,7 +258,6 @@ local function initSession(character: Model)
 	local animCtrl = AnimationController.new(character)
 	local blockUi = BlockUI.new()
 
-	-- Jump toggle tied to attack state
 	sm:onChanged(function(from: string, to: string)
 		if not humanoid then
 			return
@@ -193,11 +276,11 @@ local function initSession(character: Model)
 		blockRemote = BlockStateRemote,
 	})
 
-	-- Build a partial session table first so isToolEquipped can close over it
+	-- Partial session reference so isToolEquipped closes over it
 	local sessionRef: CombatSession = {
 		stateMachine = sm,
 		animCtrl = animCtrl,
-		comboCtrl = nil :: any, -- filled below
+		comboCtrl = nil :: any,
 		blockCtrl = blockCtrl,
 		blockUI = blockUi,
 		heartbeatConn = nil :: any,
@@ -206,10 +289,12 @@ local function initSession(character: Model)
 		toolConn1 = nil,
 		toolConn2 = nil,
 		toolEquipped = false,
+		attackerAlign = nil,
+		attackerWorldAtt = nil,
+		attackerHRPAtt = nil,
 	}
 	_session = sessionRef
 
-	-- Wire tool detection
 	_setupToolListeners(character, sessionRef)
 
 	local comboCtrl = ComboController.new({
@@ -224,21 +309,25 @@ local function initSession(character: Model)
 	})
 	sessionRef.comboCtrl = comboCtrl
 
-	-- Combo reset → tell hit counter to reset streak
-	-- (ComboController calls reset() on timeout — hook via update polling)
 	local lastComboIndex = 0
 
 	local hbConn = RunService.Heartbeat:Connect(function(dt: number)
 		sm:update(dt)
 		comboCtrl:update(dt)
 
-		-- Detect combo reset (index went from >0 to 0)
+		-- Streak reset detection
 		if lastComboIndex > 0 and comboCtrl._comboIndex == 0 then
 			_hitCounter:resetStreak()
 		end
 		lastComboIndex = comboCtrl._comboIndex
 
-		-- Debug menu update
+		-- Update attacker world attachment XZ every frame so they can still
+		-- walk horizontally while Y-locked (the attachment follows their XZ).
+		if sessionRef.attackerWorldAtt and sessionRef.attackerWorldAtt.Parent and hrp then
+			local current = sessionRef.attackerWorldAtt.WorldPosition
+			sessionRef.attackerWorldAtt.WorldPosition = Vector3.new(hrp.Position.X, current.Y, hrp.Position.Z)
+		end
+
 		_debugMenu:update({
 			state = sm:getState(),
 			comboIndex = comboCtrl._comboIndex,
@@ -250,11 +339,10 @@ local function initSession(character: Model)
 	end)
 
 	sessionRef.heartbeatConn = hbConn
-
 	blockUi:setVisible(false)
 end
 
--- ─── INPUT WIRING ────────────────────────────────────────────────────────────
+-- ─── INPUT ───────────────────────────────────────────────────────────────────
 
 InputController.onAttack:Connect(function()
 	if not _session then
@@ -277,7 +365,7 @@ InputController.onBlockEnd:Connect(function()
 	_session.blockCtrl:onBlockEnd()
 end)
 
--- ─── SERVER EVENT HANDLERS ───────────────────────────────────────────────────
+-- ─── SERVER EVENTS ───────────────────────────────────────────────────────────
 
 HitConfirmedRemote.OnClientEvent:Connect(function(result: {
 	targetUserId: number,
@@ -293,25 +381,22 @@ HitConfirmedRemote.OnClientEvent:Connect(function(result: {
 		return
 	end
 
-	-- Update hit counter
+	-- Hit counter always increments
 	_hitCounter:registerHit(result.wasBlocked, result.wasParried, result.damage)
 
-	-- Debug log
 	local tag = if result.wasParried
 		then "PARRY"
 		elseif result.blockBroken then "BREAK"
 		elseif result.wasBlocked then "BLOCK"
 		else "HIT"
-	_debugMenu:logEvent(
-		tag,
-		("dmg=%d  blk=%.0f  combo=%d"):format(result.damage, result.newBlockMeter, result.comboIndex)
-	)
+	_debugMenu:logEvent(tag, ("dmg=%d blk=%.0f c=%d"):format(result.damage, result.newBlockMeter, result.comboIndex))
 
 	if result.wasParried then
 		HitEffects.onParry()
 		return
 	end
 
+	-- Resolve target character (nil for NPC hits — that's fine now)
 	local targetChar: Model? = nil
 	if result.targetUserId ~= 0 then
 		local tp = Players:GetPlayerByUserId(result.targetUserId)
@@ -323,7 +408,8 @@ HitConfirmedRemote.OnClientEvent:Connect(function(result: {
 		if result.blockBroken then
 			HitEffects.onBlockBreak(result.position)
 		end
-	elseif targetChar then
+	else
+		-- onHitConfirmed now accepts targetChar? — nil is safe for NPC hits
 		local hitData = CombatConfig.COMBO_HITS[result.comboIndex]
 		local shakeMag = hitData and hitData.cameraShakeMagnitude or 0.4
 		HitEffects.onHitConfirmed(targetChar, shakeMag, result.position)
@@ -364,7 +450,7 @@ StateSyncRemote.OnClientEvent:Connect(function(newState: string, duration: numbe
 	local sm = _session.stateMachine
 	local humanoid = _session.humanoid
 
-	_debugMenu:logEvent("STATE", ("→ %s (dur=%.2fs)"):format(newState, duration or 0))
+	_debugMenu:logEvent("STATE", ("→ %s (%.2fs)"):format(newState, duration or 0))
 
 	if newState == "Stunned" then
 		sm:forceTransition("Stunned")
@@ -446,7 +532,7 @@ RagdollEndRemote.OnClientEvent:Connect(function()
 	end
 end)
 
--- ─── FLOAT EVENTS (TARGET — this player is being floated) ────────────────────
+-- ─── FLOAT EVENTS (this player IS the target being floated) ──────────────────
 
 FloatStartRemote.OnClientEvent:Connect(function(_duration: number)
 	if not _session then
@@ -482,22 +568,31 @@ FloatEndRemote.OnClientEvent:Connect(function()
 end)
 
 -- ─── ATTACKER FLOAT (this player LAUNCHED the air combo) ─────────────────────
--- The server fires this so the attacker visually "jumps" with the target.
--- We apply an upward velocity directly — no humanoid state change needed,
--- the player can still move horizontally while rising.
-AttackerFloatRemote.OnClientEvent:Connect(function(boostVelocity: number)
-	if not _session then
-		return
-	end
-	local hrp = _session.hrp
-	_debugMenu:logEvent("FLOAT", ("attacker boost +%.0f"):format(boostVelocity))
 
-	if hrp then
-		-- Preserve horizontal velocity; override vertical
-		local vel = hrp.AssemblyLinearVelocity
-		hrp.AssemblyLinearVelocity = Vector3.new(vel.X, boostVelocity, vel.Z)
+AttackerFloatRemote.OnClientEvent:Connect(
+	function(payload: { phase: string, velocity: number?, suspendY: number?, duration: number? })
+		if not _session then
+			return
+		end
+		local hrp = _session.hrp
+
+		if payload.phase == "boost" then
+			-- Immediate upward velocity: attacker rises with the target
+			_debugMenu:logEvent("FLOAT", ("attacker boost +%.0f"):format(payload.velocity or 0))
+			if hrp then
+				local vel = hrp.AssemblyLinearVelocity
+				hrp.AssemblyLinearVelocity = Vector3.new(vel.X, payload.velocity or 0, vel.Z)
+			end
+		elseif payload.phase == "ylock" and payload.suspendY and payload.duration then
+			-- Y-lock: create AlignPosition to hold attacker at suspendY
+			_debugMenu:logEvent(
+				"FLOAT",
+				("attacker Y-lock at %.1f for %.1fs"):format(payload.suspendY, payload.duration)
+			)
+			_applyAttackerYLock(_session, payload.suspendY, payload.duration)
+		end
 	end
-end)
+)
 
 -- ─── CHARACTER LIFECYCLE ─────────────────────────────────────────────────────
 

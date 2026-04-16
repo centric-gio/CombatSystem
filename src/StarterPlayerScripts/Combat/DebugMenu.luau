@@ -2,7 +2,7 @@
     DebugMenu.luau  (Client)
     ──────────────────────────────────────────────────────────
     Collapsible debug overlay showing real-time combat state.
-    Toggle with: ` (backtick) or F9.
+    Toggle with: L
 
     Displays:
       • Current FSM state
@@ -240,7 +240,7 @@ function DebugMenu.new(): DebugMenuType
 	end
 
 	-- ── Toggle hint ───────────────────────────────────────
-	local hint = self:_makeLabel(panel, "[ ` ] or [ F9 ] to toggle", 9, PALETTE.LABEL)
+	local hint = self:_makeLabel(panel, "L to toggle", 9, PALETTE.LABEL)
 	hint.Position = UDim2.new(0, 0, 1, -20)
 	hint.Size = UDim2.new(1, 0, 0, 16)
 	hint.TextXAlignment = Enum.TextXAlignment.Center
@@ -251,7 +251,7 @@ function DebugMenu.new(): DebugMenuType
 		if gp then
 			return
 		end
-		if input.KeyCode == Enum.KeyCode.BackQuote or input.KeyCode == Enum.KeyCode.F9 then
+		if input.KeyCode == Enum.KeyCode.L then
 			self._visible = not self._visible
 			gui.Enabled = self._visible
 		end
